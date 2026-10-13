@@ -1,0 +1,151 @@
+esphome:
+  name: esp32-wol
+  includes:
+    - secure_wol.h
+  on_boot:
+    priority: 200
+    then:
+      - lambda: 'setup_secure_wol();'
+  on_loop:
+    then:
+      - lambda: 'loop_secure_wol();'
+
+logger:
+  level: VERBOSE
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      # 1. Configuração do Flash Integrado (16MB - Modo OPI para altíssima vazão)
+      CONFIG_ESPTOOLPY_FLASHSIZE_16MB: "y"
+      CONFIG_ESPTOOLPY_FLASHMODE_OPI: "y"
+      
+      # 2. Configuração da PSRAM (8MB - Modo Octal/OPI imperativo para os limites do chip N16R8)
+      CONFIG_SPIRAM: "y"
+      CONFIG_SPIRAM_MODE_OCT: "y"
+      CONFIG_SPIRAM_SPEED_80M: "y"
+      
+      # 3. Estabilidade Operacional Otimizada de Alocações para VPN
+      CONFIG_SPIRAM_BOOT_INIT: "y"
+      CONFIG_SPIRAM_FETCH_INSTRUCTIONS: "y"
+      CONFIG_SPIRAM_RODATA: "y"
+      
+      # 4. HABILITAÇÃO DO WATCHDOG HARDWARE (Atua como pressões autônomas ao botão RET em catástrofes de software)
+      CONFIG_ESP_TASK_WDT_PANIC: "y"
+      CONFIG_ESP_TASK_WDT_TIMEOUT_S: "20"
+
+# O Componente Time viabiliza o Handshake SSL do Tailscale gerando métricas temporais contemporâneas
+time:
+  - platform: sntp
+    id: tailscale_time
+    # Explícito: sem isto o firmware herda o fuso da máquina que compila.
+    timezone: America/Sao_Paulo
+    on_time:
+      # Reinício preventivo diário, renovando a pilha de rede antes do desgaste do túnel.
+      - seconds: 0
+        minutes: 0
+        hours: 0
+        then:
+          - logger.log:
+              format: "Reinício preventivo diário das 00:00. Reiniciando o dispositivo."
+              level: INFO
+          - button.press: reinicio_automatico
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # Permite economia moderada na antena para contenção térmica enquanto preserva responsividade da malha.
+  power_save_mode: light
+  fast_connect: true
+  # A integração primária lida apenas se o link Wi-Fi perecer no éter.
+  reboot_timeout: 15min
+
+external_components:
+  - source: github://Csontikka/esphome-tailscale
+    refresh: 1d
+  
+tailscale:
+  # Requisito Categórico: A opção de Desabilitar a Expiração deve estar ativa na plataforma.
+  auth_key: !secret tailscale_auth_key
+
+
+binary_sensor:
+  # Reflete somente o enlace Wi-Fi (network::is_connected). Mantido como diagnóstico.
+  - platform: status
+    name: "Conectividade Wi-Fi Operacional"
+    id: wifi_status
+  # Estado real do túnel: ML_STATE_CONNECTED do MicroLink.
+  - platform: tailscale
+    connected:
+      name: "Conectividade Tailscale Operacional"
+      id: tailscale_vpn_ok
+
+button:
+  - platform: wake_on_lan
+    id: botao_wol
+    name: "Ligar Computador"
+    target_mac_address: !secret target_mac_address
+    internal: true
+  - platform: restart
+    id: reinicio_automatico
+    internal: true
+  # Rebind do túnel: recuperação mais barata que um reboot completo.
+  - platform: tailscale
+    reconnect:
+      name: "Reconectar Tailscale"
+      id: tailscale_reconnect
+      internal: true
+
+globals:
+  # Ciclos consecutivos de 5 min com a VPN caída. Define quando escalar de rebind para reboot.
+  - id: falhas_vpn_consecutivas
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+interval:
+  # Monitoramento programático de sanidade com janela protetiva durante a inicialização (boot).
+  - interval: 5min
+    then:
+      - if:
+          condition:
+            and:
+              # Observa o túnel Tailscale em si, e não apenas o enlace Wi-Fi
+              - binary_sensor.is_off: tailscale_vpn_ok
+              # Exigência para evitar loops eternos: avalia se o uptime já superou 600 segundos
+              - lambda: 'return id(tempo_atividade).state > 600;'
+          then:
+            - lambda: 'id(falhas_vpn_consecutivas) += 1;'
+            - if:
+                condition:
+                  lambda: 'return id(falhas_vpn_consecutivas) >= 2;'
+                then:
+                  - logger.log:
+                      format: "Ruptura contínua de conexão VPN confirmada. Procedendo com o Reset Profundo de Serviço."
+                      level: ERROR
+                  - button.press: reinicio_automatico
+                else:
+                  - logger.log:
+                      format: "VPN indisponível. Tentando rebind do túnel antes de escalar para reboot."
+                      level: WARN
+                  - button.press: tailscale_reconnect
+          else:
+            - lambda: 'id(falhas_vpn_consecutivas) = 0;'
+
+  # Rede de segurança para o caso de o SNTP não sincronizar e o gatilho das 00:00 nunca disparar.
+  - interval: 5min
+    then:
+      - if:
+          condition:
+            # 93600 s = 26 h. O reset diário mantém o uptime bem abaixo disso.
+            lambda: 'return id(tempo_atividade).state > 93600;'
+          then:
+            - logger.log:
+                format: "Uptime excedeu 26h sem reset agendado. Forçando reinício."
+                level: WARN
+            - button.press: reinicio_automatico
+sensor:
+  - platform: uptime
+    id: tempo_atividade
